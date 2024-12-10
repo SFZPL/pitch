@@ -10,30 +10,29 @@ from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
 from pptx.util import Pt, Inches
-from dotenv import load_dotenv
+import logging.handlers
 import tiktoken
 import base64
 from io import BytesIO
 from pptx.dml.color import RGBColor
-from pptx.util import Pt, Inches
 
 # Logging Configuration
 def setup_logging():
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s')
     log_file = f'pitch_deck_logs_{datetime.now().strftime("%Y%m%d")}.log'
-    
+
     # Rotating File Handler
     file_handler = logging.handlers.RotatingFileHandler(
-        log_file, 
+        log_file,
         maxBytes=10*1024*1024,  # 10MB
         backupCount=5
     )
     file_handler.setFormatter(log_formatter)
-    
+
     # Console Handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(log_formatter)
-    
+
     # Configure root logger
     logging.getLogger().addHandler(file_handler)
     logging.getLogger().addHandler(console_handler)
@@ -42,12 +41,9 @@ def setup_logging():
 # Initialize logging
 setup_logging()
 
-# Load environment variables
-load_dotenv()
-
-# Secure OpenAI API Configuration
+# Secure OpenAI API Configuration using Streamlit Secrets
 try:
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+    openai.api_key = st.secrets["OPENAI_API_KEY"]
     if not openai.api_key:
         raise ValueError("OpenAI API Key is missing")
     # Validate API key
@@ -90,8 +86,8 @@ For each slide, provide:
 """
         # Allowed file types
         self.ALLOWED_FILE_TYPES = [
-            "text/plain", 
-            "application/pdf", 
+            "text/plain",
+            "application/pdf",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         ]
@@ -170,10 +166,10 @@ For each slide, provide:
             return None
 
     def generate_pitch_deck(
-        self, 
-        content: str, 
-        additional_context: str = "", 
-        previous_slides: Optional[List[str]] = None, 
+        self,
+        content: str,
+        additional_context: str = "",
+        previous_slides: Optional[List[str]] = None,
         max_retries: int = 3
     ) -> Optional[str]:
         for attempt in range(max_retries):
@@ -200,7 +196,7 @@ For each slide, provide:
                     content = self.summarize_content(content)
                     if not content:
                         return None
-                    
+
                     total_input_tokens = (
                         self.count_tokens(self.system_prompt) +
                         self.count_tokens(full_context) +
@@ -237,10 +233,10 @@ For each slide, provide:
                 return None
 
     def update_slide(
-        self, 
-        slide_number: int, 
-        slide_content: str, 
-        edit_instructions: str, 
+        self,
+        slide_number: int,
+        slide_content: str,
+        edit_instructions: str,
         previous_slides: List[str]
     ) -> Optional[str]:
         try:
@@ -394,7 +390,7 @@ def main():
 
     with col1:
         st.header("📄 Upload & Configure")
-        
+
         uploaded_file = st.file_uploader(
             "📂 Upload Your Source Document",
             type=["txt", "pdf", "docx", "pptx"],
@@ -423,11 +419,11 @@ def main():
         if clear_button:
             for key in session_defaults:
                 st.session_state[key] = session_defaults[key]
-            st.rerun()
+            st.experimental_rerun()
 
     with col2:
         st.header("🎬 Generated Pitch Deck")
-        
+
         if not st.session_state.uploaded_file:
             st.info("📄 Upload a document to start generating your pitch deck.")
         elif st.session_state.uploaded_file and not st.session_state.pitch_deck_slides:
@@ -495,7 +491,7 @@ def main():
                                             'message': f"✅ Updated Slide {i+1}:\n{updated_slide}"
                                         })
                                         st.success(f"Slide {i+1} updated successfully!")
-                                        st.rerun()
+                                        st.experimental_rerun()
                                     else:
                                         st.error("❌ Failed to update the slide.")
                             else:
