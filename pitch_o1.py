@@ -1,3 +1,5 @@
+OPENAI_API_KEY = "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"
+
 import streamlit as st
 import openai
 import os
@@ -10,7 +12,7 @@ from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
 from pptx.util import Pt, Inches
-from dotenv import load_dotenv
+import logging.handlers
 import tiktoken
 import base64
 from io import BytesIO
@@ -42,12 +44,9 @@ def setup_logging():
 # Initialize logging
 setup_logging()
 
-# Load environment variables
-load_dotenv()
-
-# Secure OpenAI API Configuration
+# Set OpenAI API key directly
 try:
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+    openai.api_key = OPENAI_API_KEY
     if not openai.api_key:
         raise ValueError("OpenAI API Key is missing")
     # Validate API key
