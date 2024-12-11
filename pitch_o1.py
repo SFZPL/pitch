@@ -176,20 +176,26 @@ For each slide, provide:
 """
 
         self.corporate_profile_prompt = """
-You are a professional corporate profile content generator. Your task is to create a comprehensive and engaging corporate profile that effectively represents the company's mission, vision, values, products/services, achievements, and future goals.
+You are a professional corporate profile content generator. Your task is to create a comprehensive and engaging corporate profile presentation (PowerPoint style) that effectively represents the company's brand and offering.
 
 Key Elements to Include:
-1. Company Overview: Mission, Vision, Values
-2. History: Founding story, key milestones
-3. Products/Services: Detailed descriptions
-4. Market Position: Industry standing, competitive advantages
-5. Achievements: Awards, recognitions, major accomplishments
-6. Team: Leadership and key team members
-7. Future Goals: Strategic plans, growth objectives
+1. Title Slide: Company Name, Logo, and Tagline
+2. Mission, Vision, and Values
+3. Company History: Founding story, key milestones
+4. Products/Services: Detailed descriptions, unique selling points
+5. Market Position: Industry standing, competitive advantages
+6. Achievements & Awards: Recognitions, milestones
+7. Team & Leadership Overview
+8. Future Goals & Strategic Plans
+9. Contact Information
 
 Output Format:
-- Provide clear headings for each section.
-- Under each heading, include concise, professional language.
+For each slide, provide:
+1. Slide Title
+2. Content (brief bullet points)
+3. Suggested Visual Representation
+
+Focus on professionalism, clarity, and cohesive design suitable for a corporate profile PowerPoint.
 """
 
     def sanitize_input(self, text: str) -> str:
@@ -373,6 +379,35 @@ Output Format:
             st.error(f"❌ Error updating section: {e}")
             return None
 
+    def analyze_existing_presentation(self, content: str, document_type: str) -> Optional[str]:
+        # Provide an analysis of strengths, weaknesses, and suggestions
+        analysis_prompt = f"""
+You are a presentation analyst. The user has provided an existing {document_type}. 
+Please analyze the content and provide:
+- Key strengths: Which aspects are well done?
+- Potential weaknesses or areas for improvement: What could be improved?
+- Suggested tweaks or enhancements: How to strengthen the narrative, visuals, or clarity?
+
+Keep the tone constructive and professional.
+"""
+        try:
+            content = self.sanitize_input(content)
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo-16k",
+                messages=[
+                    {"role": "system", "content": analysis_prompt},
+                    {"role": "user", "content": f"Existing {document_type} Content:\n{content}"}
+                ],
+                max_tokens=2000,
+                temperature=0.7
+            )
+            analysis = response.choices[0].message.content
+            return analysis.strip()
+        except Exception as e:
+            logging.error(f"Presentation analysis error: {e}")
+            st.error(f"❌ Error analyzing presentation: {e}")
+            return None
+
 def main():
     st.set_page_config(page_title="Prez.AI Document Generator", page_icon="📊", layout="wide")
 
@@ -437,7 +472,8 @@ def main():
         'chat_history': [],
         'current_step': 'initial',
         'file_content': None,
-        'document_type': "Pitch Deck"
+        'document_type': "Pitch Deck",
+        'analysis_result': None
     }
 
     for key, default_value in session_defaults.items():
@@ -460,6 +496,7 @@ def main():
             st.session_state.generated_document_sections = []
             st.session_state.chat_history = []
             st.session_state.file_content = None
+            st.session_state.analysis_result = None
             st.session_state.current_step = 'file_uploaded'
 
         st.subheader("📝 Select Document Type")
@@ -480,6 +517,7 @@ def main():
         st.session_state.last_additional_context = additional_context
 
         generate_button = st.button("✨ Generate Document", type="primary", key="generate_button")
+        analyze_button = st.button("🔍 Analyze Existing Presentation", key="analyze_button")
         clear_button = st.button("🧹 Clear Session", key="clear_button")
 
         if clear_button:
@@ -490,35 +528,57 @@ def main():
     with col2:
         st.header("🎬 Generated Document")
 
+        if st.session_state.uploaded_file and st.session_state.file_content is None:
+            # Extract content if not already extracted
+            st.session_state.file_content = extract_text_from_file(st.session_state.uploaded_file)
+
         if not st.session_state.uploaded_file:
-            st.info("📄 Upload a document to start generating your document.")
-        elif st.session_state.uploaded_file and not st.session_state.generated_document_sections:
+            st.info("📄 Upload a document to start generating your presentation.")
+        elif st.session_state.uploaded_file and not st.session_state.generated_document_sections and not st.session_state.analysis_result:
+            # Show buttons after upload
             if generate_button:
-                st.write("Now extracting text from file...")
-                file_content = extract_text_from_file(st.session_state.uploaded_file)
-                if file_content:
-                    st.session_state.file_content = file_content
-                    st.write("The AI is cooking... please wait!")
-                    doc = st.session_state.doc_generator.generate_document(
-                        content=file_content,
-                        additional_context=st.session_state.last_additional_context,
-                        document_type=st.session_state.document_type
-                    )
-                    if doc:
-                        st.write("Generation done!")
-                        st.session_state.generated_document_sections = doc.split("\n\n")
-                        st.session_state.chat_history.append({
-                            'type': 'system',
-                            'message': f"✅ {st.session_state.document_type} Generated Successfully!"
-                        })
-                        st.session_state.current_step = 'document_generated'
+                if st.session_state.file_content:
+                    st.write("Now extracting text from file...")
+                    file_content = st.session_state.file_content
+                    if file_content:
+                        st.write("The AI is cooking... please wait!")
+                        doc = st.session_state.doc_generator.generate_document(
+                            content=file_content,
+                            additional_context=st.session_state.last_additional_context,
+                            document_type=st.session_state.document_type
+                        )
+                        if doc:
+                            st.write("Generation done!")
+                            st.session_state.generated_document_sections = doc.split("\n\n")
+                            st.session_state.chat_history.append({
+                                'type': 'system',
+                                'message': f"✅ {st.session_state.document_type} Generated Successfully!"
+                            })
+                            st.session_state.current_step = 'document_generated'
+                        else:
+                            st.session_state.chat_history.append({
+                                'type': 'error',
+                                'message': f"❌ Failed to generate {st.session_state.document_type}."
+                            })
                     else:
-                        st.session_state.chat_history.append({
-                            'type': 'error',
-                            'message': f"❌ Failed to generate {st.session_state.document_type}."
-                        })
-                else:
-                    st.error("❌ Could not extract content from the file.")
+                        st.error("❌ Could not extract content from the file.")
+
+            if analyze_button:
+                if st.session_state.file_content:
+                    with st.spinner("Analyzing existing presentation..."):
+                        analysis = st.session_state.doc_generator.analyze_existing_presentation(
+                            content=st.session_state.file_content,
+                            document_type=st.session_state.document_type
+                        )
+                        if analysis:
+                            st.session_state.analysis_result = analysis
+                            st.session_state.chat_history.append({
+                                'type': 'assistant',
+                                'message': "✅ Analysis Complete"
+                            })
+                        else:
+                            st.error("❌ Failed to analyze the presentation.")
+
 
         if st.session_state.generated_document_sections:
             section_tabs = st.tabs([f"Section {i+1}" for i in range(len(st.session_state.generated_document_sections))])
@@ -587,6 +647,10 @@ def main():
                         b64 = base64.b64encode(pptx_file.getvalue()).decode()
                         href = f'<a href="data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,{b64}" download="{st.session_state.document_type.lower().replace(" ", "_")}.pptx">📥 Download PowerPoint</a>'
                         st.markdown(href, unsafe_allow_html=True)
+
+        if st.session_state.analysis_result:
+            st.header("🔍 Presentation Analysis")
+            st.markdown(st.session_state.analysis_result, unsafe_allow_html=True)
 
     st.markdown("---")
     st.subheader("📜 Session History")
