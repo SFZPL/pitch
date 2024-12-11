@@ -5,57 +5,147 @@ import logging
 from datetime import datetime
 import re
 import time
-from typing import List, Optional, Dict, Any
-from PyPDF2 import PdfReader
-from docx import Document
+from typing import List, Optional
+from io import BytesIO
+import base64
+import logging.handlers
+
 from pptx import Presentation
 from pptx.util import Pt, Inches
-import logging.handlers
-import tiktoken
-import base64
-from io import BytesIO
 from pptx.dml.color import RGBColor
+import tiktoken
 
-# Logging Configuration
+# --------------------------------------------
+# Constants & Globals
+# --------------------------------------------
+ALLOWED_FILE_TYPES = [
+    "text/plain",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+]
+
+# Model specifics for gpt-3.5-turbo-16k
+MAX_CONTEXT = 16385  # model's max context length
+
+def clean_text(text: str) -> str:
+    text = re.sub(r'-\n', '', text)
+    text = re.sub(r'\n+', '\n', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = ''.join(char for char in text if char.isprintable())
+    return text.strip()
+
+@st.cache_data
+def count_tokens(text: str, model: str = "gpt-3.5-turbo-16k") -> int:
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+        return len(encoding.encode(str(text)))
+    except Exception as e:
+        logging.error(f"Token counting error: {e}")
+        return 0
+
+@st.cache_data
+def extract_text_from_file(file) -> Optional[str]:
+    if file.type not in ALLOWED_FILE_TYPES:
+        st.error(f"❌ Unsupported file type: {file.type}")
+        return None
+
+    try:
+        content = ""
+        file_type = file.type
+
+        if file_type == "text/plain":
+            content = file.read().decode("utf-8")
+
+        elif file_type == "application/pdf":
+            from PyPDF2 import PdfReader
+            pdf_reader = PdfReader(file)
+            content = "\n".join([page.extract_text() for page in pdf_reader.pages if page.extract_text()])
+
+        elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            from docx import Document
+            doc = Document(file)
+            content = "\n".join([para.text for para in doc.paragraphs if para.text])
+
+        elif file_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+            from pptx import Presentation
+            ppt = Presentation(file)
+            content = "\n".join([
+                paragraph.text
+                for slide in ppt.slides
+                for shape in slide.shapes
+                if shape.has_text_frame
+                for paragraph in shape.text_frame.paragraphs
+            ])
+
+        return clean_text(content)
+
+    except Exception as e:
+        logging.error(f"File extraction error: {e}")
+        st.error(f"❌ Error processing file: {e}")
+        return None
+
+@st.cache_data
+def summarize_content(content: str, max_tokens: int = 2048) -> Optional[str]:
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that summarizes text."},
+                {"role": "user", "content": f"Please provide a concise summary of the following content:\n{content}"}
+            ],
+            max_tokens=max_tokens,
+            temperature=0.5,
+        )
+        summary = response.choices[0].message.content
+        return summary.strip() if summary else None
+    except Exception as e:
+        logging.error(f"Content summarization error: {e}")
+        st.error(f"❌ Error summarizing content: {e}")
+        return None
+
 def setup_logging():
-    log_formatter = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s')
-    log_file = f'pitch_deck_logs_{datetime.now().strftime("%Y%m%d")}.log'
+    try:
+        log_formatter = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s')
+        log_file = f'pitch_deck_logs_{datetime.now().strftime("%Y%m%d")}.log'
 
-    # Rotating File Handler
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file,
-        maxBytes=10*1024*1024,  # 10MB
-        backupCount=5
-    )
-    file_handler.setFormatter(log_formatter)
+        # Rotating File Handler
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,  # 10MB
+            backupCount=5
+        )
+        file_handler.setFormatter(log_formatter)
 
-    # Console Handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_formatter)
+        # Console Handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(log_formatter)
 
-    # Configure root logger
-    logging.getLogger().addHandler(file_handler)
-    logging.getLogger().addHandler(console_handler)
-    logging.getLogger().setLevel(logging.INFO)
+        # Configure root logger
+        logger = logging.getLogger()
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        logger.setLevel(logging.INFO)
 
-# Initialize logging
+        logging.info("Logging successfully configured.")
+    except Exception as e:
+        print(f"Error setting up logging: {e}")
+        raise
+
 setup_logging()
 
-# Secure OpenAI API Configuration using Streamlit Secrets
 try:
     openai.api_key = st.secrets["OPENAI_API_KEY"]
-    if not openai.api_key:
-        raise ValueError("OpenAI API Key is missing")
-    # Validate API key
     openai.Model.list()
+    logging.info("OpenAI API key validated successfully.")
 except Exception as e:
-    logging.error(f"OpenAI API Configuration Error: {e}")
+    logging.error(f"OpenAI initialization error: {e}")
+    st.error("❌ OpenAI API initialization error.")
     raise
 
-class PitchDeckGenerator:
+class DocumentGenerator:
     def __init__(self):
-        """Initialize the Pitch Deck Generator with system prompt and configuration."""
-        self.system_prompt = """
+        self.pitch_deck_prompt = """
 You are an expert pitch deck content generator trained in creating world-class business presentations.
 Your goal is to transform raw content into a compelling narrative that captures investor attention.
 
@@ -84,186 +174,26 @@ For each slide, provide:
 2. Content
 3. Suggested Visual Representation
 """
-        # Allowed file types
-        self.ALLOWED_FILE_TYPES = [
-            "text/plain",
-            "application/pdf",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        ]
+
+        self.corporate_profile_prompt = """
+You are a professional corporate profile content generator. Your task is to create a comprehensive and engaging corporate profile that effectively represents the company's mission, vision, values, products/services, achievements, and future goals.
+
+Key Elements to Include:
+1. Company Overview: Mission, Vision, Values
+2. History: Founding story, key milestones
+3. Products/Services: Detailed descriptions
+4. Market Position: Industry standing, competitive advantages
+5. Achievements: Awards, recognitions, major accomplishments
+6. Team: Leadership and key team members
+7. Future Goals: Strategic plans, growth objectives
+
+Output Format:
+- Provide clear headings for each section.
+- Under each heading, include concise, professional language.
+"""
 
     def sanitize_input(self, text: str) -> str:
         return re.sub(r'[<>&\'"]', '', text)
-
-    def clean_text(self, text: str) -> str:
-        text = re.sub(r'-\n', '', text)
-        text = re.sub(r'\n+', '\n', text)
-        text = re.sub(r'[ \t]+', ' ', text)
-        text = ''.join(char for char in text if char.isprintable())
-        return text.strip()
-
-    def count_tokens(self, text: str, model: str = "gpt-4") -> int:
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-            return len(encoding.encode(str(text)))
-        except Exception as e:
-            logging.error(f"Token counting error: {e}")
-            return 0
-
-    def extract_text_from_file(self, file):
-        if file.type not in self.ALLOWED_FILE_TYPES:
-            st.error(f"❌ Unsupported file type: {file.type}")
-            return None
-
-        try:
-            content = ""
-            file_type = file.type
-
-            if file_type == "text/plain":
-                content = file.read().decode("utf-8")
-            elif file_type == "application/pdf":
-                pdf_reader = PdfReader(file)
-                content = "\n".join([page.extract_text() for page in pdf_reader.pages])
-            elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                doc = Document(file)
-                content = "\n".join([para.text for para in doc.paragraphs if para.text])
-            elif file_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
-                ppt = Presentation(file)
-                content = "\n".join([
-                    paragraph.text
-                    for slide in ppt.slides
-                    for shape in slide.shapes
-                    if shape.has_text_frame
-                    for paragraph in shape.text_frame.paragraphs
-                ])
-            else:
-                st.warning("⚠️ Unsupported file type")
-                return None
-
-            return self.clean_text(content)
-
-        except Exception as e:
-            logging.error(f"File extraction error: {e}")
-            st.error(f"❌ Error processing file: {e}")
-            return None
-
-    def summarize_content(self, content: str, max_tokens: int = 2048) -> Optional[str]:
-        try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that summarizes text."},
-                    {"role": "user", "content": f"Please provide a concise summary of the following content:\n{content}"}
-                ],
-                max_tokens=max_tokens,
-                temperature=0.5,
-            )
-            summary = response.choices[0].message.content
-            return summary.strip() if summary else None
-        except Exception as e:
-            logging.error(f"Content summarization error: {e}")
-            st.error(f"❌ Error summarizing content: {e}")
-            return None
-
-    def generate_pitch_deck(
-        self,
-        content: str,
-        additional_context: str = "",
-        previous_slides: Optional[List[str]] = None,
-        max_retries: int = 3
-    ) -> Optional[str]:
-        for attempt in range(max_retries):
-            try:
-                context_prefix = ""
-                if previous_slides:
-                    context_prefix = "Previous Pitch Deck Context:\n" + "\n\n".join(previous_slides)
-
-                content = self.sanitize_input(content)
-                additional_context = self.sanitize_input(additional_context)
-
-                full_context = f"{context_prefix}\n{additional_context}"
-
-                total_input_tokens = (
-                    self.count_tokens(self.system_prompt) +
-                    self.count_tokens(full_context) +
-                    self.count_tokens(content)
-                )
-
-                max_allowed_tokens = 7000
-
-                if total_input_tokens > max_allowed_tokens:
-                    st.warning("⚠️ Content is too long, summarizing to fit within token limits...")
-                    content = self.summarize_content(content)
-                    if not content:
-                        return None
-
-                    total_input_tokens = (
-                        self.count_tokens(self.system_prompt) +
-                        self.count_tokens(full_context) +
-                        self.count_tokens(content)
-                    )
-
-                messages = [
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": f"{full_context}\n\nDocument Content:\n{content}"}
-                ]
-
-                response = openai.ChatCompletion.create(
-                    model="gpt-4",
-                    messages=messages,
-                    max_tokens=2500,
-                    temperature=0.7
-                )
-
-                generated_content = response.choices[0].message.content
-                logging.info("Pitch deck successfully generated")
-                return generated_content
-
-            except openai.error.RateLimitError:
-                if attempt < max_retries - 1:
-                    logging.warning(f"Rate limit reached. Retry attempt {attempt + 1} 💫")
-                    time.sleep((attempt + 1) * 2)
-                else:
-                    logging.error("Max retries exceeded for pitch deck generation")
-                    st.error("❌ Unable to generate pitch deck due to rate limits. Please try again later.")
-                    return None
-            except Exception as e:
-                logging.error(f"Pitch deck generation error: {e}")
-                st.error(f"❌ Error generating pitch deck: {e}")
-                return None
-
-    def update_slide(
-        self,
-        slide_number: int,
-        slide_content: str,
-        edit_instructions: str,
-        previous_slides: List[str]
-    ) -> Optional[str]:
-        try:
-            edit_instructions = self.sanitize_input(edit_instructions)
-            slide_content = self.sanitize_input(slide_content)
-
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": f"You are to update Slide {slide_number} of the pitch deck."}
-            ]
-            messages.append({"role": "user", "content": f"Previous Slides:\n" + "\n\n".join(previous_slides)})
-            messages.append({"role": "user", "content": f"Current Slide {slide_number} Content:\n{slide_content}"})
-            messages.append({"role": "user", "content": f"Edit Instructions:\n{edit_instructions}"})
-
-            response = openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=messages,
-                max_tokens=500,
-                temperature=0.7
-            )
-            updated_slide = response.choices[0].message.content
-            logging.info(f"Slide {slide_number} updated successfully")
-            return updated_slide.strip()
-        except Exception as e:
-            logging.error(f"Slide update error: {e}")
-            st.error(f"❌ Error updating slide: {e}")
-            return None
 
     def hex_to_rgb(self, hex_color):
         return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
@@ -290,7 +220,6 @@ For each slide, provide:
                 fill.fore_color.rgb = RGBColor(*self.hex_to_rgb(colors['background']))
 
                 parts = slide_content.split('\n', 2)
-
                 if len(parts) > 0 and parts[0].strip():
                     title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(15), Inches(1.5))
                     title_frame = title_box.text_frame
@@ -316,8 +245,136 @@ For each slide, provide:
             st.error(f"❌ Failed to export PowerPoint: {e}")
             return None
 
+    def generate_document(
+        self,
+        content: str,
+        additional_context: str = "",
+        document_type: str = "Pitch Deck",
+        max_retries: int = 3
+    ) -> Optional[str]:
+        # Choose the appropriate system prompt
+        if document_type == "Pitch Deck":
+            system_prompt = self.pitch_deck_prompt
+        elif document_type == "Corporate Profile":
+            system_prompt = self.corporate_profile_prompt
+        else:
+            st.error("❌ Unsupported document type selected.")
+            return None
+
+        # Initial desired completion tokens
+        desired_completion_tokens = 8000
+
+        for attempt in range(max_retries):
+            try:
+                content = self.sanitize_input(content)
+                additional_context = self.sanitize_input(additional_context)
+                full_context = f"{additional_context}"
+
+                # Count tokens for the prompt
+                prompt_tokens = (
+                    count_tokens(system_prompt, model="gpt-3.5-turbo-16k") +
+                    count_tokens(full_context, model="gpt-3.5-turbo-16k") +
+                    count_tokens(content, model="gpt-3.5-turbo-16k")
+                )
+
+                # Check if it fits in max context
+                if prompt_tokens + desired_completion_tokens > MAX_CONTEXT:
+                    st.warning("⚠️ Content plus desired output too large, summarizing content...")
+                    summarized = summarize_content(content)
+                    if summarized:
+                        content = summarized
+                        # Recount after summarization
+                        prompt_tokens = (
+                            count_tokens(system_prompt, model="gpt-3.5-turbo-16k") +
+                            count_tokens(full_context, model="gpt-3.5-turbo-16k") +
+                            count_tokens(content, model="gpt-3.5-turbo-16k")
+                        )
+                        # If still too large, reduce desired_completion_tokens
+                        if prompt_tokens + desired_completion_tokens > MAX_CONTEXT:
+                            # Calculate a safe maximum completion tokens that fit in the context
+                            safe_max = MAX_CONTEXT - prompt_tokens - 500  # a 500 token safety margin
+                            if safe_max < 1000:
+                                # If still too large, maybe warn user or force another summarization
+                                st.warning("⚠️ Even after summarization, content is too large. Further reducing completion tokens.")
+                                safe_max = max(500, safe_max) # ensure some reasonable output
+                            desired_completion_tokens = safe_max
+                    else:
+                        # Summarization failed, cannot proceed
+                        return None
+
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo-16k",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"{full_context}\n\nDocument Content:\n{content}"}
+                    ],
+                    max_tokens=desired_completion_tokens,
+                    temperature=0.7
+                )
+
+                generated_content = response.choices[0].message.content
+                logging.info(f"{document_type} successfully generated.")
+                return generated_content
+
+            except openai.error.RateLimitError:
+                if attempt < max_retries - 1:
+                    logging.warning(f"Rate limit reached. Retry attempt {attempt + 1} 💫")
+                    time.sleep((attempt + 1) * 2)
+                else:
+                    logging.error("Max retries exceeded for document generation.")
+                    st.error("❌ Unable to generate document due to rate limits. Please try again later.")
+                    return None
+            except openai.error.InvalidRequestError as ire:
+                logging.error(f"Invalid request error: {ire}")
+                st.error(f"❌ Error generating {document_type}: {ire}")
+                return None
+            except Exception as e:
+                logging.error(f"{document_type} generation error: {e}")
+                st.error(f"❌ Error generating {document_type}: {e}")
+                return None
+
+    def update_section(
+        self,
+        section_number: int,
+        section_content: str,
+        edit_instructions: str,
+        previous_sections: List[str],
+        document_type: str
+    ) -> Optional[str]:
+        edit_instructions = self.sanitize_input(edit_instructions)
+        section_content = self.sanitize_input(section_content)
+
+        if document_type == "Pitch Deck":
+            system_prompt = self.pitch_deck_prompt
+        elif document_type == "Corporate Profile":
+            system_prompt = self.corporate_profile_prompt
+        else:
+            st.error("❌ Unsupported document type selected.")
+            return None
+
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo-16k",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"You are to update Section {section_number} of the {document_type}."},
+                    {"role": "user", "content": f"Previous Sections:\n" + "\n\n".join(previous_sections)},
+                    {"role": "user", "content": f"Current Section {section_number} Content:\n{section_content}"},
+                    {"role": "user", "content": f"Edit Instructions:\n{edit_instructions}"}
+                ],
+                max_tokens=2000,
+                temperature=0.7
+            )
+            updated_section = response.choices[0].message.content
+            logging.info(f"Section {section_number} updated successfully.")
+            return updated_section.strip()
+        except Exception as e:
+            logging.error(f"Section update error: {e}")
+            st.error(f"❌ Error updating section: {e}")
+            return None
+
 def main():
-    st.set_page_config(page_title="Prez.AI's Pitch Deck Generator", page_icon="📊", layout="wide")
+    st.set_page_config(page_title="Prez.AI Document Generator", page_icon="📊", layout="wide")
 
     st.markdown("""
     <style>
@@ -367,19 +424,20 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="main-header">Prez.AI Pitch Deck Generator 🎨📈</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subheader">Transform Your Ideas into Compelling Presentations 🚀</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">Prez.AI Document Generator 🎨📈</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subheader">Transform Your Ideas into Compelling Documents 🚀</div>', unsafe_allow_html=True)
 
-    if 'pitch_generator' not in st.session_state:
-        st.session_state.pitch_generator = PitchDeckGenerator()
+    if 'doc_generator' not in st.session_state:
+        st.session_state.doc_generator = DocumentGenerator()
 
     session_defaults = {
         'uploaded_file': None,
-        'pitch_deck_slides': [],
+        'generated_document_sections': [],
         'last_additional_context': "",
         'chat_history': [],
         'current_step': 'initial',
-        'file_content': None
+        'file_content': None,
+        'document_type': "Pitch Deck"
     }
 
     for key, default_value in session_defaults.items():
@@ -399,101 +457,115 @@ def main():
 
         if uploaded_file != st.session_state.uploaded_file:
             st.session_state.uploaded_file = uploaded_file
-            st.session_state.pitch_deck_slides = []
+            st.session_state.generated_document_sections = []
             st.session_state.chat_history = []
             st.session_state.file_content = None
             st.session_state.current_step = 'file_uploaded'
 
+        st.subheader("📝 Select Document Type")
+        document_type = st.selectbox(
+            "Choose the type of document you want to generate:",
+            ["Pitch Deck", "Corporate Profile"],
+            index=["Pitch Deck", "Corporate Profile"].index(st.session_state.document_type)
+        )
+        st.session_state.document_type = document_type
+
         st.subheader("💡 Additional Context")
         additional_context = st.text_area(
-            "Provide specific pitch deck guidelines:",
+            "Provide specific guidelines or preferences:",
             value=st.session_state.last_additional_context,
             placeholder="e.g., Target audience, preferred tone, key messages...",
             height=150
         )
         st.session_state.last_additional_context = additional_context
 
-        generate_button = st.button("✨ Generate Deck", type="primary", key="generate_button")
+        generate_button = st.button("✨ Generate Document", type="primary", key="generate_button")
         clear_button = st.button("🧹 Clear Session", key="clear_button")
 
         if clear_button:
             for key in session_defaults:
                 st.session_state[key] = session_defaults[key]
-            st.experimental_rerun()
+            st.rerun()
 
     with col2:
-        st.header("🎬 Generated Pitch Deck")
+        st.header("🎬 Generated Document")
 
         if not st.session_state.uploaded_file:
-            st.info("📄 Upload a document to start generating your pitch deck.")
-        elif st.session_state.uploaded_file and not st.session_state.pitch_deck_slides:
+            st.info("📄 Upload a document to start generating your document.")
+        elif st.session_state.uploaded_file and not st.session_state.generated_document_sections:
             if generate_button:
-                with st.spinner("🔄 Analyzing document and generating pitch deck..."):
-                    file_content = st.session_state.pitch_generator.extract_text_from_file(st.session_state.uploaded_file)
-                    if file_content:
-                        st.session_state.file_content = file_content
-                        pitch_deck = st.session_state.pitch_generator.generate_pitch_deck(
-                            content=file_content,
-                            additional_context=st.session_state.last_additional_context
-                        )
-                        if pitch_deck:
-                            st.session_state.pitch_deck_slides = pitch_deck.split("\n\n")
-                            st.session_state.chat_history.append({
-                                'type': 'system',
-                                'message': "✅ Pitch Deck Generated Successfully!"
-                            })
-                            st.session_state.current_step = 'deck_generated'
-                        else:
-                            st.session_state.chat_history.append({
-                                'type': 'error',
-                                'message': "❌ Failed to generate pitch deck. Please check your file and try again."
-                            })
+                st.write("Now extracting text from file...")
+                file_content = extract_text_from_file(st.session_state.uploaded_file)
+                if file_content:
+                    st.session_state.file_content = file_content
+                    st.write("The AI is cooking... please wait!")
+                    doc = st.session_state.doc_generator.generate_document(
+                        content=file_content,
+                        additional_context=st.session_state.last_additional_context,
+                        document_type=st.session_state.document_type
+                    )
+                    if doc:
+                        st.write("Generation done!")
+                        st.session_state.generated_document_sections = doc.split("\n\n")
+                        st.session_state.chat_history.append({
+                            'type': 'system',
+                            'message': f"✅ {st.session_state.document_type} Generated Successfully!"
+                        })
+                        st.session_state.current_step = 'document_generated'
                     else:
-                        st.error("❌ Could not extract content from the file.")
+                        st.session_state.chat_history.append({
+                            'type': 'error',
+                            'message': f"❌ Failed to generate {st.session_state.document_type}."
+                        })
+                else:
+                    st.error("❌ Could not extract content from the file.")
 
-        if st.session_state.pitch_deck_slides:
-            slide_tabs = st.tabs([f"Slide {i+1}" for i in range(len(st.session_state.pitch_deck_slides))])
+        if st.session_state.generated_document_sections:
+            section_tabs = st.tabs([f"Section {i+1}" for i in range(len(st.session_state.generated_document_sections))])
 
-            for i, slide_content in enumerate(st.session_state.pitch_deck_slides):
-                with slide_tabs[i]:
-                    slide_parts = slide_content.split('\n', 2)
-                    slide_title = slide_parts[0] if len(slide_parts) > 0 else ""
-                    slide_body = slide_parts[1] if len(slide_parts) > 1 else ""
-                    slide_visual = slide_parts[2] if len(slide_parts) > 2 else ""
+            for i, section_content in enumerate(st.session_state.generated_document_sections):
+                with section_tabs[i]:
+                    parts = section_content.split('\n', 2)
+                    slide_title = parts[0].strip() if len(parts) > 0 else "No Title"
+                    slide_body = parts[1].strip() if len(parts) > 1 else ""
+                    slide_visual = parts[2].strip() if len(parts) > 2 else ""
 
                     st.subheader(slide_title)
-                    st.markdown(slide_body, unsafe_allow_html=True)
-                    st.markdown(f"{slide_visual}")
+                    if slide_body:
+                        st.markdown(slide_body, unsafe_allow_html=True)
+                    if slide_visual:
+                        st.markdown(slide_visual, unsafe_allow_html=True)
 
-                    with st.expander("✏️ Edit This Slide"):
+                    with st.expander("✏️ Edit This Section"):
                         edit_instructions = st.text_area(
-                            f"Modify Slide {i+1}",
+                            f"Modify Section {i+1}",
                             placeholder="Adjust content, tone, or add specific details...",
                             key=f"edit_instructions_{i}"
                         )
-                        if st.button(f"💾 Update Slide {i+1}", key=f"update_slide_{i}"):
+                        if st.button(f"💾 Update Section {i+1}", key=f"update_section_{i}"):
                             if edit_instructions:
                                 st.session_state.chat_history.append({
                                     'type': 'user',
-                                    'message': f"✍️ Edit Slide {i+1}: {edit_instructions}"
+                                    'message': f"✍️ Edit Section {i+1}: {edit_instructions}"
                                 })
-                                with st.spinner("🔧 Updating slide..."):
-                                    updated_slide = st.session_state.pitch_generator.update_slide(
-                                        slide_number=i+1,
-                                        slide_content=slide_content,
+                                with st.spinner("🔧 Updating section..."):
+                                    updated_section = st.session_state.doc_generator.update_section(
+                                        section_number=i+1,
+                                        section_content=section_content,
                                         edit_instructions=edit_instructions,
-                                        previous_slides=st.session_state.pitch_deck_slides
+                                        previous_sections=st.session_state.generated_document_sections,
+                                        document_type=st.session_state.document_type
                                     )
-                                    if updated_slide:
-                                        st.session_state.pitch_deck_slides[i] = updated_slide
+                                    if updated_section:
+                                        st.session_state.generated_document_sections[i] = updated_section
                                         st.session_state.chat_history.append({
                                             'type': 'assistant',
-                                            'message': f"✅ Updated Slide {i+1}:\n{updated_slide}"
+                                            'message': f"✅ Updated Section {i+1}:\n{updated_section}"
                                         })
-                                        st.success(f"Slide {i+1} updated successfully!")
-                                        st.experimental_rerun()
+                                        st.success(f"Section {i+1} updated successfully!")
+                                        st.rerun()
                                     else:
-                                        st.error("❌ Failed to update the slide.")
+                                        st.error("❌ Failed to update the section.")
                             else:
                                 st.warning("⚠️ Please provide edit instructions.")
 
@@ -501,17 +573,19 @@ def main():
             with col2_1:
                 st.download_button(
                     label="💾 Download as Text",
-                    data="\n\n".join(st.session_state.pitch_deck_slides),
-                    file_name="pitch_deck.txt",
+                    data="\n\n".join(st.session_state.generated_document_sections),
+                    file_name=f"{st.session_state.document_type.lower().replace(' ', '_')}.txt",
                     mime="text/plain"
                 )
             with col2_2:
                 export_pptx = st.button("📂 Export as PowerPoint")
                 if export_pptx:
-                    pptx_file = st.session_state.pitch_generator.export_to_pptx(st.session_state.pitch_deck_slides)
+                    pptx_file = st.session_state.doc_generator.export_to_pptx(
+                        slides=st.session_state.generated_document_sections
+                    )
                     if pptx_file:
                         b64 = base64.b64encode(pptx_file.getvalue()).decode()
-                        href = f'<a href="data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,{b64}" download="pitch_deck.pptx">📥 Download PowerPoint</a>'
+                        href = f'<a href="data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,{b64}" download="{st.session_state.document_type.lower().replace(" ", "_")}.pptx">📥 Download PowerPoint</a>'
                         st.markdown(href, unsafe_allow_html=True)
 
     st.markdown("---")
