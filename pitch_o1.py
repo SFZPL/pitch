@@ -1,5 +1,5 @@
 import streamlit as st
-import openai
+import google.generativeai as genai
 import os
 import logging
 from datetime import datetime
@@ -9,6 +9,8 @@ from typing import List, Optional
 from io import BytesIO
 import base64
 import logging.handlers
+import textwrap  # Added import
+import json
 
 from pptx import Presentation
 from pptx.util import Pt, Inches
@@ -25,9 +27,10 @@ ALLOWED_FILE_TYPES = [
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 ]
 
-# Model specifics for gpt-3.5-turbo-16k
-MAX_CONTEXT = 16385  # model's max context length
-
+MODEL_NAME = "gpt-3.5-turbo-16k"  # keep this for token counting
+GEMINI_MODEL_NAME = "gemini-pro" # Name of the gemini model to use
+MAX_CONTEXT = 16384  # max context length for gpt-3.5-turbo-16k
+GEMINI_MAX_OUTPUT_TOKENS = 2048  # Max output tokens for gemini-pro
 def clean_text(text: str) -> str:
     text = re.sub(r'-\n', '', text)
     text = re.sub(r'\n+', '\n', text)
@@ -36,7 +39,8 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 @st.cache_data
-def count_tokens(text: str, model: str = "gpt-3.5-turbo-16k") -> int:
+def count_tokens(text: str, model: str = MODEL_NAME) -> int:
+    """Counts the number of tokens in a given text using tiktoken."""
     try:
         encoding = tiktoken.encoding_for_model(model)
         return len(encoding.encode(str(text)))
@@ -46,6 +50,7 @@ def count_tokens(text: str, model: str = "gpt-3.5-turbo-16k") -> int:
 
 @st.cache_data
 def extract_text_from_file(file) -> Optional[str]:
+    """Extracts text content from different file types."""
     if file.type not in ALLOWED_FILE_TYPES:
         st.error(f"❌ Unsupported file type: {file.type}")
         return None
@@ -85,26 +90,22 @@ def extract_text_from_file(file) -> Optional[str]:
         st.error(f"❌ Error processing file: {e}")
         return None
 
-@st.cache_data
-def summarize_content(content: str, max_tokens: int = 2048) -> Optional[str]:
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes text."},
-                {"role": "user", "content": f"Please provide a concise summary of the following content:\n{content}"}
-            ],
-            max_tokens=max_tokens,
-            temperature=0.5,
-        )
-        summary = response.choices[0].message.content
-        return summary.strip() if summary else None
-    except Exception as e:
-        logging.error(f"Content summarization error: {e}")
-        st.error(f"❌ Error summarizing content: {e}")
-        return None
+def dynamic_margin(prompt_tokens: int) -> int:
+    """Calculates a dynamic margin based on the prompt size."""
+    # Margin is proportional to the prompt size, min 100, max 500, ~5% of prompt_tokens
+    return max(100, min(500, int(prompt_tokens * 0.05)))
+
+def compute_max_tokens(messages: List[dict], desired_completion_tokens: int) -> int:
+    """Computes the maximum tokens available for a completion."""
+    prompt_tokens = sum(count_tokens(m["content"], model=MODEL_NAME) for m in messages)
+    margin = dynamic_margin(prompt_tokens)
+    if prompt_tokens + desired_completion_tokens > MAX_CONTEXT:
+        available = MAX_CONTEXT - prompt_tokens - margin
+        return max(500, min(desired_completion_tokens, available))
+    return desired_completion_tokens
 
 def setup_logging():
+    """Configures logging to both console and file."""
     try:
         log_formatter = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s')
         log_file = f'pitch_deck_logs_{datetime.now().strftime("%Y%m%d")}.log'
@@ -133,17 +134,45 @@ def setup_logging():
         raise
 
 setup_logging()
-
 try:
-    openai.api_key = st.secrets["OPENAI_API_KEY"]
-    openai.Model.list()
-    logging.info("OpenAI API key validated successfully.")
+    # Access the API key from st.secrets
+    genai.configure(api_key=st.secrets["google"]["api_key"])
+    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+    logging.info("Google API key validated successfully.")
 except Exception as e:
-    logging.error(f"OpenAI initialization error: {e}")
-    st.error("❌ OpenAI API initialization error.")
+    logging.error(f"Google API initialization error: {e}")
+    st.error("❌ Google API initialization error.")
     raise
 
+def summarize_content(content: str, prompt_tokens: int = 0) -> Optional[str]:
+    """Summarizes content using Gemini."""
+    margin = dynamic_margin(prompt_tokens) if prompt_tokens else 500
+    desired_completion_tokens = 1500  # shorter summary
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant that summarizes text."},
+        {"role": "user", "content": f"Please provide a concise summary of the following content:\n{content}"}
+    ]
+    prompt_size = sum(count_tokens(m["content"], model=MODEL_NAME) for m in messages) #keep this for tokens as gemini doesn't count tokens
+    available = MAX_CONTEXT - prompt_size - margin
+    max_output_tokens = max(500, min(desired_completion_tokens, available))
+
+    try:
+        response = model.generate_content(
+            contents=[f"""
+        You are a helpful assistant that summarizes text.
+        Please provide a concise summary of the following content:\n{content}
+        """],
+        generation_config=genai.types.GenerationConfig(max_output_tokens=max_output_tokens, temperature=0.5)
+        )
+        summary = response.text
+        return summary.strip() if summary else None
+    except Exception as e:
+        logging.error(f"Content summarization error: {e}")
+        st.error(f"❌ Error summarizing content: {e}")
+        return None
+
 class DocumentGenerator:
+    """A class to generate and manipulate documents (pitch decks, corporate profiles)."""
     def __init__(self):
         self.pitch_deck_prompt = """
 You are an expert pitch deck content generator trained in creating world-class business presentations.
@@ -157,7 +186,7 @@ Key Presentation Principles:
 5. Use Data-Driven Insights
 6. Maintain Professional and Exciting Tone
 
-Structure Recommendations:
+Follow this Strict Structure:
 - Title Slide: Company Name, Tagline
 - Problem Statement: Clear, Impactful
 - Solution: Innovative Approach
@@ -169,10 +198,13 @@ Structure Recommendations:
 - Call to Action
 
 Output Format:
-For each slide, provide:
-1. Slide Title
-2. Content
-3. Suggested Visual Representation
+For each slide, provide a JSON object in the following structure:
+{
+    "slide_title": "[Slide Title Here]",
+    "content": "[Concise slide content here]",
+    "suggested_visual": "[Description or URL for a suitable visual]"
+}
+Ensure your JSON output is always valid.
 """
 
         self.corporate_profile_prompt = """
@@ -190,21 +222,27 @@ Key Elements to Include:
 9. Contact Information
 
 Output Format:
-For each slide, provide:
-1. Slide Title
-2. Content (brief bullet points)
-3. Suggested Visual Representation
-
-Focus on professionalism, clarity, and cohesive design suitable for a corporate profile PowerPoint.
+For each slide, provide a JSON object in the following structure:
+{
+    "slide_title": "[Slide Title Here]",
+    "content": "[Concise slide content here]",
+    "suggested_visual": "[Description or URL for a suitable visual]"
+}
+Ensure your JSON output is always valid.
 """
 
+        self.token_cache = {}  # Initialize token cache
+
     def sanitize_input(self, text: str) -> str:
+        """Removes potentially malicious characters from input text."""
         return re.sub(r'[<>&\'"]', '', text)
 
     def hex_to_rgb(self, hex_color):
+        """Converts a hex color code to an RGB tuple."""
         return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
-    def export_to_pptx(self, slides: List[str]) -> Optional[BytesIO]:
+    def export_to_pptx(self, slides: List[dict]) -> Optional[BytesIO]:
+        """Exports the slides data to a PowerPoint presentation."""
         try:
             prs = Presentation()
             prs.slide_width = Inches(16)
@@ -217,7 +255,7 @@ Focus on professionalism, clarity, and cohesive design suitable for a corporate 
                 'accent': 'EF4444',
             }
 
-            for slide_content in slides:
+            for slide_data in slides:
                 slide_layout = prs.slide_layouts[6]
                 slide = prs.slides.add_slide(slide_layout)
                 background = slide.background
@@ -225,21 +263,28 @@ Focus on professionalism, clarity, and cohesive design suitable for a corporate 
                 fill.solid()
                 fill.fore_color.rgb = RGBColor(*self.hex_to_rgb(colors['background']))
 
-                parts = slide_content.split('\n', 2)
-                if len(parts) > 0 and parts[0].strip():
+                slide_title = slide_data.get('slide_title', "")
+                slide_body = slide_data.get('content', "")
+                #slide_visual = slide_data.get('suggested_visual', "") # Not used
+
+                if slide_title:
                     title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(15), Inches(1.5))
                     title_frame = title_box.text_frame
-                    title_frame.text = parts[0]
+                    title_frame.text = slide_title
                     title_frame.paragraphs[0].font.size = Pt(44)
                     title_frame.paragraphs[0].font.color.rgb = RGBColor(*self.hex_to_rgb(colors['primary']))
                     title_frame.paragraphs[0].font.bold = True
 
-                if len(parts) > 1 and parts[1].strip():
+                if slide_body:
                     content_box = slide.shapes.add_textbox(Inches(0.5), Inches(2), Inches(15), Inches(6))
                     content_frame = content_box.text_frame
-                    content_frame.text = parts[1]
+                    content_frame.text = slide_body
                     content_frame.paragraphs[0].font.size = Pt(24)
                     content_frame.paragraphs[0].font.color.rgb = RGBColor(*self.hex_to_rgb(colors['secondary']))
+
+                # Optionally, we could incorporate the visual suggestion into the PPTX.
+                # But currently, we only textually represent it in the interface.
+                # No changes here unless you want to add a placeholder shape or something similar.
 
             pptx_file = BytesIO()
             prs.save(pptx_file)
@@ -251,14 +296,21 @@ Focus on professionalism, clarity, and cohesive design suitable for a corporate 
             st.error(f"❌ Failed to export PowerPoint: {e}")
             return None
 
+    def _count_tokens(self, text: str, model: str = MODEL_NAME) -> int:
+        """Counts tokens for a string using the cache."""
+        cache_key = (text, model)
+        if cache_key not in self.token_cache:
+            self.token_cache[cache_key] = count_tokens(text, model)
+        return self.token_cache[cache_key]
+
     def generate_document(
         self,
         content: str,
         additional_context: str = "",
         document_type: str = "Pitch Deck",
         max_retries: int = 3
-    ) -> Optional[str]:
-        # Choose the appropriate system prompt
+    ) -> Optional[List[dict]]:
+        """Generates a document (pitch deck or corporate profile) using Gemini."""
         if document_type == "Pitch Deck":
             system_prompt = self.pitch_deck_prompt
         elif document_type == "Corporate Profile":
@@ -266,9 +318,6 @@ Focus on professionalism, clarity, and cohesive design suitable for a corporate 
         else:
             st.error("❌ Unsupported document type selected.")
             return None
-
-        # Initial desired completion tokens
-        desired_completion_tokens = 8000
 
         for attempt in range(max_retries):
             try:
@@ -276,53 +325,84 @@ Focus on professionalism, clarity, and cohesive design suitable for a corporate 
                 additional_context = self.sanitize_input(additional_context)
                 full_context = f"{additional_context}"
 
-                # Count tokens for the prompt
                 prompt_tokens = (
-                    count_tokens(system_prompt, model="gpt-3.5-turbo-16k") +
-                    count_tokens(full_context, model="gpt-3.5-turbo-16k") +
-                    count_tokens(content, model="gpt-3.5-turbo-16k")
+                    self._count_tokens(system_prompt, model=MODEL_NAME) +
+                    self._count_tokens(full_context, model=MODEL_NAME) +
+                    self._count_tokens(content, model=MODEL_NAME)
                 )
 
-                # Check if it fits in max context
+                margin = dynamic_margin(prompt_tokens)
+                desired_completion_tokens = max(1000, MAX_CONTEXT - prompt_tokens - margin)
+
                 if prompt_tokens + desired_completion_tokens > MAX_CONTEXT:
                     st.warning("⚠️ Content plus desired output too large, summarizing content...")
-                    summarized = summarize_content(content)
+                    summarized = summarize_content(content, prompt_tokens=prompt_tokens)
                     if summarized:
                         content = summarized
-                        # Recount after summarization
                         prompt_tokens = (
-                            count_tokens(system_prompt, model="gpt-3.5-turbo-16k") +
-                            count_tokens(full_context, model="gpt-3.5-turbo-16k") +
-                            count_tokens(content, model="gpt-3.5-turbo-16k")
+                            self._count_tokens(system_prompt, model=MODEL_NAME) +
+                            self._count_tokens(full_context, model=MODEL_NAME) +
+                            self._count_tokens(content, model=MODEL_NAME)
                         )
-                        # If still too large, reduce desired_completion_tokens
-                        if prompt_tokens + desired_completion_tokens > MAX_CONTEXT:
-                            # Calculate a safe maximum completion tokens that fit in the context
-                            safe_max = MAX_CONTEXT - prompt_tokens - 500  # a 500 token safety margin
-                            if safe_max < 1000:
-                                # If still too large, maybe warn user or force another summarization
-                                st.warning("⚠️ Even after summarization, content is too large. Further reducing completion tokens.")
-                                safe_max = max(500, safe_max) # ensure some reasonable output
-                            desired_completion_tokens = safe_max
+                        margin = dynamic_margin(prompt_tokens)
+                        desired_completion_tokens = max(500, MAX_CONTEXT - prompt_tokens - margin)
                     else:
-                        # Summarization failed, cannot proceed
                         return None
 
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo-16k",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"{full_context}\n\nDocument Content:\n{content}"}
-                    ],
-                    max_tokens=desired_completion_tokens,
-                    temperature=0.7
-                )
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant that formats pitch decks."},
+                    {"role": "user", "content": f"""
+{system_prompt}
 
-                generated_content = response.choices[0].message.content
-                logging.info(f"{document_type} successfully generated.")
-                return generated_content
+Transform the following content into a structured pitch deck. Each slide MUST be a JSON object as specified.
 
-            except openai.error.RateLimitError:
+Document Content:
+{full_context}
+
+{content}
+"""}
+                ]
+
+                response = model.generate_content(
+                        contents=[f"""
+                {system_prompt}
+
+                Transform the following content into a structured pitch deck. Each slide MUST be a JSON object as specified.
+
+                Document Content:
+                {full_context}
+
+                {content}
+                """],
+                    generation_config=genai.types.GenerationConfig(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, temperature=0.7)
+                    )
+
+                generated_content = response.text
+                
+                try:
+                    
+                    potential_json_strings = re.findall(r'\{[^{}]*?\}', generated_content)
+                    slides = []
+                    for json_str in potential_json_strings:
+                        try:
+                             slides.append(json.loads(json_str))
+                        except json.JSONDecodeError:
+                            continue
+
+                    if isinstance(slides, list) and isinstance(slides[0], dict):
+                        logging.info(f"{document_type} successfully generated.")
+                        return slides
+                    else:
+                        logging.error("Generated content was not a list of valid JSON objects.")
+                        st.error(f"❌ Generated content was not formatted as expected. Please try again.")
+                        return None
+                except json.JSONDecodeError as e:
+                     logging.error(f"JSON decode error during document generation: {e}")
+                     st.error(f"❌ Error decoding JSON response. Please try again. Details: {e}")
+                     return None
+
+
+            except Exception as e:
                 if attempt < max_retries - 1:
                     logging.warning(f"Rate limit reached. Retry attempt {attempt + 1} 💫")
                     time.sleep((attempt + 1) * 2)
@@ -330,25 +410,18 @@ Focus on professionalism, clarity, and cohesive design suitable for a corporate 
                     logging.error("Max retries exceeded for document generation.")
                     st.error("❌ Unable to generate document due to rate limits. Please try again later.")
                     return None
-            except openai.error.InvalidRequestError as ire:
-                logging.error(f"Invalid request error: {ire}")
-                st.error(f"❌ Error generating {document_type}: {ire}")
-                return None
-            except Exception as e:
-                logging.error(f"{document_type} generation error: {e}")
-                st.error(f"❌ Error generating {document_type}: {e}")
-                return None
+
 
     def update_section(
         self,
         section_number: int,
-        section_content: str,
+        section_content: dict,
         edit_instructions: str,
-        previous_sections: List[str],
+        previous_sections: List[dict],
         document_type: str
-    ) -> Optional[str]:
+    ) -> Optional[dict]:
+        """Updates a specific section of the document based on user instructions."""
         edit_instructions = self.sanitize_input(edit_instructions)
-        section_content = self.sanitize_input(section_content)
 
         if document_type == "Pitch Deck":
             system_prompt = self.pitch_deck_prompt
@@ -358,29 +431,47 @@ Focus on professionalism, clarity, and cohesive design suitable for a corporate 
             st.error("❌ Unsupported document type selected.")
             return None
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"You are to update Slide {section_number} of the {document_type}."},
+            {"role": "user", "content": f"Previous Slides:\n" + json.dumps(previous_sections)},
+            {"role": "user", "content": f"Current Slide {section_number} Content:\n{json.dumps(section_content)}"},
+            {"role": "user", "content": f"Edit Instructions:\n{edit_instructions}"}
+        ]
+
+        prompt_tokens = sum(self._count_tokens(m["content"], model=MODEL_NAME) for m in messages)
+        margin = dynamic_margin(prompt_tokens)
+        desired_completion_tokens = max(1000, MAX_CONTEXT - prompt_tokens - margin)
+        max_tokens = max(500, min(desired_completion_tokens, MAX_CONTEXT - prompt_tokens - margin))
+
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo-16k",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"You are to update Section {section_number} of the {document_type}."},
-                    {"role": "user", "content": f"Previous Sections:\n" + "\n\n".join(previous_sections)},
-                    {"role": "user", "content": f"Current Section {section_number} Content:\n{section_content}"},
-                    {"role": "user", "content": f"Edit Instructions:\n{edit_instructions}"}
-                ],
-                max_tokens=2000,
-                temperature=0.7
-            )
-            updated_section = response.choices[0].message.content
-            logging.info(f"Section {section_number} updated successfully.")
-            return updated_section.strip()
+            response = model.generate_content(
+                        contents=[f"""
+                        {system_prompt}
+                        You are to update Slide {section_number} of the {document_type}.
+                        Previous Slides: {json.dumps(previous_sections)}
+                        Current Slide {section_number} Content: {json.dumps(section_content)}
+                        Edit Instructions: {edit_instructions}
+                        """],
+                    generation_config=genai.types.GenerationConfig(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, temperature=0.7)
+                    )
+            updated_section_content = response.text
+            try:
+                updated_section = json.loads(updated_section_content)
+                logging.info(f"Slide {section_number} updated successfully.")
+                return updated_section
+            except json.JSONDecodeError as e:
+                logging.error(f"JSON decode error during slide update: {e}")
+                st.error(f"❌ Error decoding JSON response for slide update. Details: {e}")
+                return None
+
         except Exception as e:
-            logging.error(f"Section update error: {e}")
-            st.error(f"❌ Error updating section: {e}")
+            logging.error(f"Slide update error: {e}")
+            st.error(f"❌ Error updating slide: {e}")
             return None
 
     def analyze_existing_presentation(self, content: str, document_type: str) -> Optional[str]:
-        # Provide an analysis of strengths, weaknesses, and suggestions
+        """Analyzes an existing presentation and provides feedback."""
         analysis_prompt = f"""
 You are a presentation analyst. The user has provided an existing {document_type}. 
 Please analyze the content and provide:
@@ -390,23 +481,44 @@ Please analyze the content and provide:
 
 Keep the tone constructive and professional.
 """
+        content = self.sanitize_input(content)
+        messages = [
+            {"role": "system", "content": analysis_prompt},
+            {"role": "user", "content": f"Existing {document_type} Content:\n{content}"}
+        ]
+
+        prompt_tokens = sum(self._count_tokens(m["content"], model=MODEL_NAME) for m in messages)
+        margin = dynamic_margin(prompt_tokens)
+        desired_completion_tokens = max(1000, MAX_CONTEXT - prompt_tokens - margin)
+        max_tokens = max(500, min(desired_completion_tokens, MAX_CONTEXT - prompt_tokens - margin))
+
         try:
-            content = self.sanitize_input(content)
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo-16k",
-                messages=[
-                    {"role": "system", "content": analysis_prompt},
-                    {"role": "user", "content": f"Existing {document_type} Content:\n{content}"}
-                ],
-                max_tokens=2000,
-                temperature=0.7
-            )
-            analysis = response.choices[0].message.content
-            return analysis.strip()
+           response = model.generate_content(
+                        contents=[f"""
+                        {analysis_prompt}
+                        Existing {document_type} Content: {content}
+                        """],
+                    generation_config=genai.types.GenerationConfig(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, temperature=0.7)
+                    )
+           analysis = response.text
+           return analysis.strip()
         except Exception as e:
             logging.error(f"Presentation analysis error: {e}")
             st.error(f"❌ Error analyzing presentation: {e}")
             return None
+
+def format_full_document_view(sections):
+    """Formats the generated document sections into a full, readable document view."""
+    full_document = []
+    for i, section_data in enumerate(sections, 1):
+        slide_title = section_data.get('slide_title', f"Slide {i}")
+        slide_body = section_data.get('content', "")
+        slide_visual = section_data.get('suggested_visual', "")
+
+        section_text = f"**Slide {i}:**\n\n**Title:** {slide_title}\n\n**Content:** {slide_body}\n\n**Visual:** {slide_visual}\n\n"
+        full_document.append(section_text)
+
+    return "\n\n".join(full_document)
 
 def main():
     st.set_page_config(page_title="Prez.AI Document Generator", page_icon="📊", layout="wide")
@@ -452,10 +564,42 @@ def main():
         border-radius: 5px;
         font-size: 14px;
     }
-    .user { background-color: #f0f0f0; }
+        .user { background-color: #f0f0f0; }
     .assistant { background-color: #e6f3ff; }
     .system { background-color: #e6ffe6; }
     .error { background-color: #ffe6e6; }
+    .copy-area {
+    border: 1px solid #ccc;
+    padding: 10px;
+    border-radius: 5px;
+    margin-top: 10px;
+    background-color: #f9f9f9;
+    }
+    .tooltip {
+        position: relative;
+        display: inline-block;
+    }
+
+    .tooltip .tooltiptext {
+        visibility: hidden;
+        width: 200px;
+        background-color: #555;
+        color: #fff;
+        text-align: center;
+        border-radius: 6px;
+        padding: 5px;
+        position: absolute;
+        z-index: 1;
+        bottom: 125%;
+        left: 50%;
+        margin-left: -100px;
+        opacity: 0;
+        transition: opacity 0.3s;
+    }
+    .tooltip:hover .tooltiptext {
+        visibility: visible;
+        opacity: 1;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -472,24 +616,24 @@ def main():
         'chat_history': [],
         'current_step': 'initial',
         'file_content': None,
-        'document_type': "Pitch Deck",
-        'analysis_result': None
+        'document_type': None,
+        'analysis_result': None,
+        'view_mode': "Slide View",
+        'action': None
     }
 
     for key, default_value in session_defaults.items():
         if key not in st.session_state:
             st.session_state[key] = default_value
 
-    col1, col2 = st.columns([1, 2])
-
-    with col1:
-        st.header("📄 Upload & Configure")
+    with st.container():
 
         uploaded_file = st.file_uploader(
             "📂 Upload Your Source Document",
             type=["txt", "pdf", "docx", "pptx"],
             help="Supported formats: Text, PDF, Word, PowerPoint"
         )
+
 
         if uploaded_file != st.session_state.uploaded_file:
             st.session_state.uploaded_file = uploaded_file
@@ -498,159 +642,189 @@ def main():
             st.session_state.file_content = None
             st.session_state.analysis_result = None
             st.session_state.current_step = 'file_uploaded'
+            st.session_state.document_type = None
+            st.session_state.action = None
 
-        st.subheader("📝 Select Document Type")
-        document_type = st.selectbox(
-            "Choose the type of document you want to generate:",
-            ["Pitch Deck", "Corporate Profile"],
-            index=["Pitch Deck", "Corporate Profile"].index(st.session_state.document_type)
-        )
-        st.session_state.document_type = document_type
-
-        st.subheader("💡 Additional Context")
-        additional_context = st.text_area(
-            "Provide specific guidelines or preferences:",
-            value=st.session_state.last_additional_context,
-            placeholder="e.g., Target audience, preferred tone, key messages...",
-            height=150
-        )
-        st.session_state.last_additional_context = additional_context
-
-        generate_button = st.button("✨ Generate Document", type="primary", key="generate_button")
-        analyze_button = st.button("🔍 Analyze Existing Presentation", key="analyze_button")
-        clear_button = st.button("🧹 Clear Session", key="clear_button")
-
-        if clear_button:
-            for key in session_defaults:
-                st.session_state[key] = session_defaults[key]
-            st.rerun()
-
-    with col2:
-        st.header("🎬 Generated Document")
-
-        if st.session_state.uploaded_file and st.session_state.file_content is None:
-            # Extract content if not already extracted
-            st.session_state.file_content = extract_text_from_file(st.session_state.uploaded_file)
-
-        if not st.session_state.uploaded_file:
-            st.info("📄 Upload a document to start generating your presentation.")
-        elif st.session_state.uploaded_file and not st.session_state.generated_document_sections and not st.session_state.analysis_result:
-            # Show buttons after upload
-            if generate_button:
-                if st.session_state.file_content:
-                    st.write("Now extracting text from file...")
-                    file_content = st.session_state.file_content
-                    if file_content:
-                        st.write("The AI is cooking... please wait!")
-                        doc = st.session_state.doc_generator.generate_document(
-                            content=file_content,
-                            additional_context=st.session_state.last_additional_context,
-                            document_type=st.session_state.document_type
-                        )
-                        if doc:
-                            st.write("Generation done!")
-                            st.session_state.generated_document_sections = doc.split("\n\n")
-                            st.session_state.chat_history.append({
-                                'type': 'system',
-                                'message': f"✅ {st.session_state.document_type} Generated Successfully!"
-                            })
-                            st.session_state.current_step = 'document_generated'
-                        else:
-                            st.session_state.chat_history.append({
-                                'type': 'error',
-                                'message': f"❌ Failed to generate {st.session_state.document_type}."
-                            })
+        if uploaded_file:
+            action = st.selectbox(
+            "Select action",
+             ["Generate Pitch Deck", "Generate Corporate Profile", "Analyze Presentation"],
+             index = ["Generate Pitch Deck", "Generate Corporate Profile", "Analyze Presentation"].index(st.session_state.action) if st.session_state.action else 0
+            )
+            
+            st.session_state.action = action
+            
+            if not st.session_state.file_content:
+               with st.spinner("Extracting file content..."):
+                    st.session_state.file_content = extract_text_from_file(uploaded_file)
+                    if st.session_state.file_content:
+                        st.success("📝 **File Content Extracted Successfully!**")
+                        st.write(f"**Token Count:** {count_tokens(st.session_state.file_content)}")
                     else:
                         st.error("❌ Could not extract content from the file.")
 
-            if analyze_button:
-                if st.session_state.file_content:
-                    with st.spinner("Analyzing existing presentation..."):
-                        analysis = st.session_state.doc_generator.analyze_existing_presentation(
-                            content=st.session_state.file_content,
-                            document_type=st.session_state.document_type
-                        )
-                        if analysis:
-                            st.session_state.analysis_result = analysis
-                            st.session_state.chat_history.append({
-                                'type': 'assistant',
-                                'message': "✅ Analysis Complete"
-                            })
-                        else:
-                            st.error("❌ Failed to analyze the presentation.")
 
+            if st.button("Confirm"):
+
+                if st.session_state.file_content and not st.session_state.generated_document_sections and st.session_state.action:
+                    if st.session_state.action == "Generate Pitch Deck":
+                        with st.spinner("🤖 Generating pitch deck... Please wait!"):
+                            doc = st.session_state.doc_generator.generate_document(
+                                content = st.session_state.file_content,
+                                document_type = "Pitch Deck"
+                            )
+                            if doc:
+                                st.success("✅ **Pitch deck generated successfully!**")
+                                st.session_state.generated_document_sections = doc
+                                st.session_state.document_type = "Pitch Deck"
+                                st.session_state.chat_history = []
+                            else:
+                                st.error("❌ Failed to generate pitch deck")
+                    elif st.session_state.action == "Generate Corporate Profile":
+                        with st.spinner("🤖 Generating corporate profile... Please wait!"):
+                            doc = st.session_state.doc_generator.generate_document(
+                                content = st.session_state.file_content,
+                                document_type = "Corporate Profile"
+                            )
+                            if doc:
+                                st.success("✅ **Corporate profile generated successfully!**")
+                                st.session_state.generated_document_sections = doc
+                                st.session_state.document_type = "Corporate Profile"
+                                st.session_state.chat_history = []
+                            else:
+                                st.error("❌ Failed to generate corporate profile")
+                    elif st.session_state.action == "Analyze Presentation":
+                        if uploaded_file.type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+                            with st.spinner("🔍 Analyzing presentation..."):
+                                analysis = st.session_state.doc_generator.analyze_existing_presentation(
+                                    content = st.session_state.file_content,
+                                    document_type = "Presentation"
+                                    )
+                                if analysis:
+                                    st.success("✅ **Presentation analysis complete!**")
+                                    st.session_state.analysis_result = analysis
+                                    st.session_state.chat_history = []
+                                else:
+                                    st.error("❌ Failed to analyze the presentation.")
+
+                        else:
+                            st.error("❌ Analysis is only supported for PPTX files.")
+                    else:
+                         st.error("❌ Please select an action.")
+        else:
+            st.info("📄 Upload a document to begin.")
 
         if st.session_state.generated_document_sections:
-            section_tabs = st.tabs([f"Section {i+1}" for i in range(len(st.session_state.generated_document_sections))])
 
-            for i, section_content in enumerate(st.session_state.generated_document_sections):
-                with section_tabs[i]:
-                    parts = section_content.split('\n', 2)
-                    slide_title = parts[0].strip() if len(parts) > 0 else "No Title"
-                    slide_body = parts[1].strip() if len(parts) > 1 else ""
-                    slide_visual = parts[2].strip() if len(parts) > 2 else ""
+            view_mode = st.radio(
+                "View Mode",
+                ["Slide View", "Full Document View"],
+                 horizontal=True,
+                 help="Choose how you want to view the generated document",
+                 index=["Slide View", "Full Document View"].index(st.session_state.view_mode)
+            )
 
-                    st.subheader(slide_title)
-                    if slide_body:
-                        st.markdown(slide_body, unsafe_allow_html=True)
-                    if slide_visual:
-                        st.markdown(slide_visual, unsafe_allow_html=True)
+            st.session_state.view_mode = view_mode
 
-                    with st.expander("✏️ Edit This Section"):
-                        edit_instructions = st.text_area(
-                            f"Modify Section {i+1}",
-                            placeholder="Adjust content, tone, or add specific details...",
-                            key=f"edit_instructions_{i}"
-                        )
-                        if st.button(f"💾 Update Section {i+1}", key=f"update_section_{i}"):
-                            if edit_instructions:
-                                st.session_state.chat_history.append({
-                                    'type': 'user',
-                                    'message': f"✍️ Edit Section {i+1}: {edit_instructions}"
-                                })
-                                with st.spinner("🔧 Updating section..."):
-                                    updated_section = st.session_state.doc_generator.update_section(
-                                        section_number=i+1,
-                                        section_content=section_content,
-                                        edit_instructions=edit_instructions,
-                                        previous_sections=st.session_state.generated_document_sections,
-                                        document_type=st.session_state.document_type
-                                    )
-                                    if updated_section:
-                                        st.session_state.generated_document_sections[i] = updated_section
-                                        st.session_state.chat_history.append({
-                                            'type': 'assistant',
-                                            'message': f"✅ Updated Section {i+1}:\n{updated_section}"
-                                        })
-                                        st.success(f"Section {i+1} updated successfully!")
-                                        st.rerun()
-                                    else:
-                                        st.error("❌ Failed to update the section.")
+            if st.session_state.view_mode == "Slide View":
+                slide_tabs = st.tabs([f"Slide {i+1}" for i in range(len(st.session_state.generated_document_sections))])
+
+                for i, section_data in enumerate(st.session_state.generated_document_sections):
+                     with slide_tabs[i]:
+                        slide_title = section_data.get('slide_title', 'No Title')
+                        slide_body = section_data.get('content', '')
+                        slide_visual = section_data.get('suggested_visual', '')
+
+                        st.subheader(slide_title)
+                        if slide_body:
+                            st.markdown(slide_body, unsafe_allow_html=True)
+                        else:
+                            st.markdown("_No content provided._")
+                        if slide_visual:
+                            if re.match(r'^https?://', slide_visual):
+                                st.image(slide_visual)
                             else:
-                                st.warning("⚠️ Please provide edit instructions.")
+                                # If the visual is not a URL, display as placeholder
+                                st.markdown(f'<div class="tooltip"><img src="https://via.placeholder.com/800x600?text={slide_visual.replace(" ", "+")}" alt="Placeholder Visual" style="max-width:100%;" /><span class="tooltiptext">Placeholder: {slide_visual}</span></div>', unsafe_allow_html=True)
+                        else:
+                            st.markdown("_No visual provided._")
+
+                        with st.expander("✏️ Edit This Slide"):
+                            
+                            user_input = st.text_input(f"Edit Slide {i + 1} Content:",key=f"slide_edit_{i}", placeholder="Enter your instructions for this slide...")
+
+                            if st.button(f"Submit Edit Slide {i+1}",key=f"submit_edit_{i}"):
+
+                                if user_input:
+                                    st.session_state.chat_history.append({
+                                        'type': 'user',
+                                        'message': f"✍️ Edit Slide {i+1}: {user_input}"
+                                    })
+                                    with st.spinner("🔧 Updating slide..."):
+                                        updated_section = st.session_state.doc_generator.update_section(
+                                            section_number=i+1,
+                                            section_content=section_data,
+                                            edit_instructions=user_input,
+                                            previous_sections=st.session_state.generated_document_sections,
+                                            document_type=st.session_state.document_type
+                                        )
+                                        if updated_section:
+                                            st.session_state.generated_document_sections[i] = updated_section
+                                            st.session_state.chat_history.append({
+                                                'type': 'assistant',
+                                                'message': f"✅ Updated Slide {i+1}:\n{json.dumps(updated_section)}"
+                                            })
+                                            st.success(f"Slide {i+1} updated successfully!")
+                                            st.experimental_rerun()
+                                        else:
+                                            st.error("❌ Failed to update the slide.")
+            else:
+                 st.header("📄 Full Document View")
+                
+                 # Format the full document
+                 full_document_text = format_full_document_view(st.session_state.generated_document_sections)
+                
+                # Display the full document
+                 st.markdown(full_document_text)
 
             col2_1, col2_2 = st.columns(2)
             with col2_1:
-                st.download_button(
-                    label="💾 Download as Text",
-                    data="\n\n".join(st.session_state.generated_document_sections),
-                    file_name=f"{st.session_state.document_type.lower().replace(' ', '_')}.txt",
-                    mime="text/plain"
-                )
+                if st.session_state.view_mode == "Slide View":
+                   # Download slides as text
+                    slide_texts = [json.dumps(slide) for slide in st.session_state.generated_document_sections]
+                    st.download_button(
+                        label="💾 Download Slides as JSON",
+                        data="\n\n".join(slide_texts),
+                        file_name=f"{st.session_state.document_type.lower().replace(' ', '_')}.json",
+                        mime="application/json"
+                    )
+                else:
+                     # Download full document view as text
+                    st.download_button(
+                        label="💾 Download Full Document as Text",
+                        data=format_full_document_view(st.session_state.generated_document_sections),
+                        file_name=f"{st.session_state.document_type.lower().replace(' ', '_')}.txt",
+                        mime="text/plain"
+                    )
+
             with col2_2:
                 export_pptx = st.button("📂 Export as PowerPoint")
                 if export_pptx:
-                    pptx_file = st.session_state.doc_generator.export_to_pptx(
-                        slides=st.session_state.generated_document_sections
-                    )
-                    if pptx_file:
-                        b64 = base64.b64encode(pptx_file.getvalue()).decode()
-                        href = f'<a href="data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,{b64}" download="{st.session_state.document_type.lower().replace(" ", "_")}.pptx">📥 Download PowerPoint</a>'
-                        st.markdown(href, unsafe_allow_html=True)
+                    with st.spinner("Exporting to PowerPoint..."):
+                        pptx_file = st.session_state.doc_generator.export_to_pptx(
+                            slides=st.session_state.generated_document_sections
+                        )
+                        if pptx_file:
+                            b64 = base64.b64encode(pptx_file.getvalue()).decode()
+                            href = f'<a href="data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,{b64}" download="{st.session_state.document_type.lower().replace(" ", "_")}.pptx">📥 Download PowerPoint</a>'
+                            st.markdown(href, unsafe_allow_html=True)
+                        else:
+                            st.error("❌ Failed to export PowerPoint.")
 
         if st.session_state.analysis_result:
             st.header("🔍 Presentation Analysis")
             st.markdown(st.session_state.analysis_result, unsafe_allow_html=True)
+
 
     st.markdown("---")
     st.subheader("📜 Session History")
