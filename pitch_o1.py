@@ -775,7 +775,7 @@ def main():
                                                 'message': f"✅ Updated Slide {i+1}:\n{json.dumps(updated_section)}"
                                             })
                                             st.success(f"Slide {i+1} updated successfully!")
-                                            st.experimental_rerun()
+                                            st.rerun()
                                         else:
                                             st.error("❌ Failed to update the slide.")
             else:
