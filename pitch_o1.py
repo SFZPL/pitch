@@ -28,9 +28,10 @@ ALLOWED_FILE_TYPES = [
 ]
 
 MODEL_NAME = "gpt-3.5-turbo-16k"  # keep this for token counting
-GEMINI_MODEL_NAME = "gemini-pro" # Name of the gemini model to use
+GEMINI_MODEL_NAME = "gemini-pro"  # Name of the gemini model to use
 MAX_CONTEXT = 16384  # max context length for gpt-3.5-turbo-16k
 GEMINI_MAX_OUTPUT_TOKENS = 2048  # Max output tokens for gemini-pro
+
 def clean_text(text: str) -> str:
     text = re.sub(r'-\n', '', text)
     text = re.sub(r'\n+', '\n', text)
@@ -152,7 +153,7 @@ def summarize_content(content: str, prompt_tokens: int = 0) -> Optional[str]:
         {"role": "system", "content": "You are a helpful assistant that summarizes text."},
         {"role": "user", "content": f"Please provide a concise summary of the following content:\n{content}"}
     ]
-    prompt_size = sum(count_tokens(m["content"], model=MODEL_NAME) for m in messages) #keep this for tokens as gemini doesn't count tokens
+    prompt_size = sum(count_tokens(m["content"], model=MODEL_NAME) for m in messages)  # keep this for tokens as gemini doesn't count tokens
     available = MAX_CONTEXT - prompt_size - margin
     max_output_tokens = max(500, min(desired_completion_tokens, available))
 
@@ -162,7 +163,7 @@ def summarize_content(content: str, prompt_tokens: int = 0) -> Optional[str]:
         You are a helpful assistant that summarizes text.
         Please provide a concise summary of the following content:\n{content}
         """],
-        generation_config=genai.types.GenerationConfig(max_output_tokens=max_output_tokens, temperature=0.5)
+            generation_config=genai.types.GenerationConfig(max_output_tokens=max_output_tokens, temperature=0.5)
         )
         summary = response.text
         return summary.strip() if summary else None
@@ -265,7 +266,7 @@ Ensure your JSON output is always valid.
 
                 slide_title = slide_data.get('slide_title', "")
                 slide_body = slide_data.get('content', "")
-                #slide_visual = slide_data.get('suggested_visual', "") # Not used
+                # slide_visual = slide_data.get('suggested_visual', "")  # Not used
 
                 if slide_title:
                     title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(15), Inches(1.5))
@@ -282,8 +283,8 @@ Ensure your JSON output is always valid.
                     content_frame.paragraphs[0].font.size = Pt(24)
                     content_frame.paragraphs[0].font.color.rgb = RGBColor(*self.hex_to_rgb(colors['secondary']))
 
-                # Optionally, we could incorporate the visual suggestion into the PPTX.
-                # But currently, we only textually represent it in the interface.
+                # Optionally, incorporate the visual suggestion into the PPTX.
+                # Currently, it's only represented textually in the interface.
                 # No changes here unless you want to add a placeholder shape or something similar.
 
             pptx_file = BytesIO()
@@ -304,13 +305,14 @@ Ensure your JSON output is always valid.
         return self.token_cache[cache_key]
 
     def generate_document(
-        self,
-        content: str,
-        additional_context: str = "",
-        document_type: str = "Pitch Deck",
-        max_retries: int = 3
-    ) -> Optional[List[dict]]:
+            self,
+            content: str,
+            document_type: str = "Pitch Deck",
+            max_retries: int = 3
+        ) -> Optional[List[dict]]:
         """Generates a document (pitch deck or corporate profile) using Gemini."""
+
+        # Choose the built-in base system prompt
         if document_type == "Pitch Deck":
             system_prompt = self.pitch_deck_prompt
         elif document_type == "Corporate Profile":
@@ -321,94 +323,68 @@ Ensure your JSON output is always valid.
 
         for attempt in range(max_retries):
             try:
-                content = self.sanitize_input(content)
-                additional_context = self.sanitize_input(additional_context)
-                full_context = f"{additional_context}"
-
-                prompt_tokens = (
-                    self._count_tokens(system_prompt, model=MODEL_NAME) +
-                    self._count_tokens(full_context, model=MODEL_NAME) +
-                    self._count_tokens(content, model=MODEL_NAME)
-                )
-
-                margin = dynamic_margin(prompt_tokens)
-                desired_completion_tokens = max(1000, MAX_CONTEXT - prompt_tokens - margin)
-
-                if prompt_tokens + desired_completion_tokens > MAX_CONTEXT:
-                    st.warning("⚠️ Content plus desired output too large, summarizing content...")
-                    summarized = summarize_content(content, prompt_tokens=prompt_tokens)
-                    if summarized:
-                        content = summarized
-                        prompt_tokens = (
-                            self._count_tokens(system_prompt, model=MODEL_NAME) +
-                            self._count_tokens(full_context, model=MODEL_NAME) +
-                            self._count_tokens(content, model=MODEL_NAME)
-                        )
-                        margin = dynamic_margin(prompt_tokens)
-                        desired_completion_tokens = max(500, MAX_CONTEXT - prompt_tokens - margin)
-                    else:
-                        return None
-
-                messages = [
-                    {"role": "system", "content": "You are a helpful assistant that formats pitch decks."},
-                    {"role": "user", "content": f"""
-{system_prompt}
-
-Transform the following content into a structured pitch deck. Each slide MUST be a JSON object as specified.
-
-Document Content:
-{full_context}
-
-{content}
-"""}
-                ]
-
-                response = model.generate_content(
-                        contents=[f"""
+                # Create the base prompt
+                full_prompt = f"""
                 {system_prompt}
 
-                Transform the following content into a structured pitch deck. Each slide MUST be a JSON object as specified.
+                INSTRUCTIONS:
+                - Split the content into multiple slides.
+                - Each slide must include:
+                1. A title under 'slide_title'.
+                2. Concise content under 'content'.
+                3. A suggested visual under 'suggested_visual'.
+                - Ensure the output follows this JSON format:
+                {{
+                    "slide_title": "Title of Slide",
+                    "content": "Concise slide content here.",
+                    "suggested_visual": "Description or URL for a suitable visual."
+                }}
+                """
 
-                Document Content:
-                {full_context}
+                # Append the content to be processed
+                full_prompt += f"\nCONTENT TO PROCESS:\n{content}\n"
 
-                {content}
-                """],
-                    generation_config=genai.types.GenerationConfig(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, temperature=0.7)
+                # Call the AI model
+                response = model.generate_content(
+                    contents=[full_prompt],
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, 
+                        temperature=0.7
                     )
+                )
 
+                # Log the raw output for debugging
                 generated_content = response.text
-                
-                try:
-                    
-                    potential_json_strings = re.findall(r'\{[^{}]*?\}', generated_content)
-                    slides = []
-                    for json_str in potential_json_strings:
-                        try:
-                             slides.append(json.loads(json_str))
-                        except json.JSONDecodeError:
-                            continue
+                logging.debug(f"Raw Generated Content: {generated_content}")
 
-                    if isinstance(slides, list) and isinstance(slides[0], dict):
-                        logging.info(f"{document_type} successfully generated.")
-                        return slides
-                    else:
-                        logging.error("Generated content was not a list of valid JSON objects.")
-                        st.error(f"❌ Generated content was not formatted as expected. Please try again.")
-                        return None
-                except json.JSONDecodeError as e:
-                     logging.error(f"JSON decode error during document generation: {e}")
-                     st.error(f"❌ Error decoding JSON response. Please try again. Details: {e}")
-                     return None
+                # Extract multiple JSON objects
+                slides = []
+                potential_json_strings = re.findall(r'\{.*?\}', generated_content, re.DOTALL)
+                for json_str in potential_json_strings:
+                    try:
+                        slide = json.loads(json_str)
+                        if "slide_title" in slide and "content" in slide:
+                            slides.append(slide)
+                    except json.JSONDecodeError:
+                        logging.error(f"JSON decode error for: {json_str}")
+                        continue
 
+                # Fallback: If only one slide is generated, attempt to reprocess
+                if len(slides) < 2:
+                    logging.warning("Generated content included insufficient slides. Retrying...")
+                    continue  # Retry if slides are insufficient
+
+                # Validate if multiple slides are generated
+                if len(slides) > 1:
+                    logging.info(f"Document generated successfully with {len(slides)} slides.")
+                    return slides
 
             except Exception as e:
+                logging.error(f"Error during document generation: {e}")
                 if attempt < max_retries - 1:
-                    logging.warning(f"Rate limit reached. Retry attempt {attempt + 1} 💫")
-                    time.sleep((attempt + 1) * 2)
+                    time.sleep(2)  # Backoff before retrying
                 else:
-                    logging.error("Max retries exceeded for document generation.")
-                    st.error("❌ Unable to generate document due to rate limits. Please try again later.")
+                    st.error("❌ Document generation failed after multiple attempts.")
                     return None
 
 
@@ -446,15 +422,15 @@ Document Content:
 
         try:
             response = model.generate_content(
-                        contents=[f"""
-                        {system_prompt}
-                        You are to update Slide {section_number} of the {document_type}.
-                        Previous Slides: {json.dumps(previous_sections)}
-                        Current Slide {section_number} Content: {json.dumps(section_content)}
-                        Edit Instructions: {edit_instructions}
-                        """],
-                    generation_config=genai.types.GenerationConfig(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, temperature=0.7)
-                    )
+                contents=[f"""
+                {system_prompt}
+                You are to update Slide {section_number} of the {document_type}.
+                Previous Slides: {json.dumps(previous_sections)}
+                Current Slide {section_number} Content: {json.dumps(section_content)}
+                Edit Instructions: {edit_instructions}
+                """],
+                generation_config=genai.types.GenerationConfig(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, temperature=0.7)
+            )
             updated_section_content = response.text
             try:
                 updated_section = json.loads(updated_section_content)
@@ -487,25 +463,91 @@ Keep the tone constructive and professional.
             {"role": "user", "content": f"Existing {document_type} Content:\n{content}"}
         ]
 
-        prompt_tokens = sum(self._count_tokens(m["content"], model=MODEL_NAME) for m in messages)
+        prompt_tokens = sum(count_tokens(m["content"], model=MODEL_NAME) for m in messages)
         margin = dynamic_margin(prompt_tokens)
         desired_completion_tokens = max(1000, MAX_CONTEXT - prompt_tokens - margin)
         max_tokens = max(500, min(desired_completion_tokens, MAX_CONTEXT - prompt_tokens - margin))
 
         try:
-           response = model.generate_content(
-                        contents=[f"""
-                        {analysis_prompt}
-                        Existing {document_type} Content: {content}
-                        """],
-                    generation_config=genai.types.GenerationConfig(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, temperature=0.7)
-                    )
-           analysis = response.text
-           return analysis.strip()
+            response = model.generate_content(
+                contents=[f"""
+                {analysis_prompt}
+                Existing {document_type} Content: {content}
+                """],
+                generation_config=genai.types.GenerationConfig(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, temperature=0.7)
+            )
+            analysis = response.text
+            return analysis.strip()
         except Exception as e:
             logging.error(f"Presentation analysis error: {e}")
             st.error(f"❌ Error analyzing presentation: {e}")
             return None
+
+    def apply_global_edit(self, instruction: str, slides: List[dict], document_type: str, max_retries: int = 3) -> Optional[List[dict]]:
+        """Applies a global edit instruction to all slides."""
+        edited_slides = []
+        for i, slide in enumerate(slides, 1):
+            for attempt in range(max_retries):
+                try:
+                    system_prompt = self.pitch_deck_prompt if document_type == "Pitch Deck" else self.corporate_profile_prompt
+
+                    full_prompt = f"""
+                    {system_prompt}
+
+                    INSTRUCTIONS:
+                    - Apply the following edit to the slide.
+                    - Ensure the slide remains coherent and follows the original structure.
+
+                    EDIT INSTRUCTION:
+                    {instruction}
+
+                    CURRENT SLIDE CONTENT:
+                    {{
+                        "slide_title": "{slide.get('slide_title', '')}",
+                        "content": "{slide.get('content', '')}",
+                        "suggested_visual": "{slide.get('suggested_visual', '')}"
+                    }}
+
+                    UPDATED SLIDE CONTENT:
+                    {{
+                        "slide_title": "[Slide Title Here]",
+                        "content": "[Updated slide content here]",
+                        "suggested_visual": "[Updated description or URL for a suitable visual]"
+                    }}
+                    Ensure your JSON output is always valid.
+                    """
+
+                    response = model.generate_content(
+                        contents=[full_prompt],
+                        generation_config=genai.types.GenerationConfig(
+                            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS, 
+                            temperature=0.7
+                        )
+                    )
+
+                    updated_content = response.text
+                    updated_slide = json.loads(updated_content)
+
+                    if all(key in updated_slide for key in ("slide_title", "content", "suggested_visual")):
+                        edited_slides.append(updated_slide)
+                        logging.info(f"Slide {i} edited successfully.")
+                        break  # Exit retry loop on success
+                    else:
+                        logging.error(f"Missing keys in updated slide {i}. Retrying...")
+                        continue
+
+                except json.JSONDecodeError as e:
+                    logging.error(f"JSON decode error for slide {i}: {e}")
+                except Exception as e:
+                    logging.error(f"Error applying global edit to slide {i}: {e}")
+
+                if attempt < max_retries - 1:
+                    time.sleep(2)  # Backoff before retrying
+                else:
+                    st.error(f"❌ Failed to apply global edit to slide {i} after multiple attempts.")
+                    return None
+
+        return edited_slides
 
 def format_full_document_view(sections):
     """Formats the generated document sections into a full, readable document view."""
@@ -515,10 +557,17 @@ def format_full_document_view(sections):
         slide_body = section_data.get('content', "")
         slide_visual = section_data.get('suggested_visual', "")
 
-        section_text = f"**Slide {i}:**\n\n**Title:** {slide_title}\n\n**Content:** {slide_body}\n\n**Visual:** {slide_visual}\n\n"
+        section_text = f"**Slide {i}:**\n\n" \
+                       f"**Title:** {slide_title}\n\n" \
+                       f"**Content:**\n\n{slide_body}\n\n" \
+                       f"**Suggested visual idea:**\n\n{slide_visual}\n\n"
         full_document.append(section_text)
 
     return "\n\n".join(full_document)
+
+# --------------------------------------------
+# Main Application
+# --------------------------------------------
 
 def main():
     st.set_page_config(page_title="Prez.AI Document Generator", page_icon="📊", layout="wide")
@@ -612,7 +661,6 @@ def main():
     session_defaults = {
         'uploaded_file': None,
         'generated_document_sections': [],
-        'last_additional_context': "",
         'chat_history': [],
         'current_step': 'initial',
         'file_content': None,
@@ -646,71 +694,86 @@ def main():
             st.session_state.action = None
 
         if uploaded_file:
-            action = st.selectbox(
-            "Select action",
-             ["Generate Pitch Deck", "Generate Corporate Profile", "Analyze Presentation"],
-             index = ["Generate Pitch Deck", "Generate Corporate Profile", "Analyze Presentation"].index(st.session_state.action) if st.session_state.action else 0
-            )
-            
-            st.session_state.action = action
-            
+            st.markdown("### 📝 Processing Your File")
+
+            # Display a loading spinner and extract file content
             if not st.session_state.file_content:
-               with st.spinner("Extracting file content..."):
+                with st.spinner("🕒 Extracting file content... Please wait!"):
                     st.session_state.file_content = extract_text_from_file(uploaded_file)
-                    if st.session_state.file_content:
-                        st.success("📝 **File Content Extracted Successfully!**")
-                        st.write(f"**Token Count:** {count_tokens(st.session_state.file_content)}")
-                    else:
-                        st.error("❌ Could not extract content from the file.")
 
+                if st.session_state.file_content:
+                    st.markdown("""
+                    <div style="background-color: #e6f4ea; padding: 10px; border-radius: 5px; margin: 10px 0;">
+                        <p style="color: #2e7d32; font-weight: bold; font-size: 16px;">
+                        ✅ File content extracted successfully! Your document is ready for processing.
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown("""
+                    <div style="background-color: #ffebee; padding: 10px; border-radius: 5px; margin: 10px 0;">
+                        <p style="color: #b71c1c; font-weight: bold; font-size: 16px;">
+                        ❌ Could not extract content from the file. Please upload a supported file type.
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-            if st.button("Confirm"):
+            # Display next steps only after successful extraction
+            if st.session_state.file_content:
+                st.markdown("### 🛠️ Next Step")
+                
+                # Select action
+                action = st.selectbox(
+                    "Select action:",
+                    ["Generate Pitch Deck", "Generate Corporate Profile", "Analyze Presentation"],
+                    index=0
+                )
+                st.session_state.action = action
 
-                if st.session_state.file_content and not st.session_state.generated_document_sections and st.session_state.action:
+                # Confirm button
+                if st.button("Confirm"):
                     if st.session_state.action == "Generate Pitch Deck":
-                        with st.spinner("🤖 Generating pitch deck... Please wait!"):
+                        with st.spinner("🤖 Generating your pitch deck... Please wait!"):
                             doc = st.session_state.doc_generator.generate_document(
-                                content = st.session_state.file_content,
-                                document_type = "Pitch Deck"
+                                content=st.session_state.file_content,
+                                document_type="Pitch Deck"
                             )
                             if doc:
                                 st.success("✅ **Pitch deck generated successfully!**")
                                 st.session_state.generated_document_sections = doc
                                 st.session_state.document_type = "Pitch Deck"
-                                st.session_state.chat_history = []
                             else:
-                                st.error("❌ Failed to generate pitch deck")
+                                st.error("❌ Failed to generate pitch deck.")
                     elif st.session_state.action == "Generate Corporate Profile":
-                        with st.spinner("🤖 Generating corporate profile... Please wait!"):
+                        with st.spinner("🤖 Generating your corporate profile... Please wait!"):
                             doc = st.session_state.doc_generator.generate_document(
-                                content = st.session_state.file_content,
-                                document_type = "Corporate Profile"
+                                content=st.session_state.file_content,
+                                document_type="Corporate Profile"
                             )
                             if doc:
                                 st.success("✅ **Corporate profile generated successfully!**")
                                 st.session_state.generated_document_sections = doc
                                 st.session_state.document_type = "Corporate Profile"
-                                st.session_state.chat_history = []
                             else:
-                                st.error("❌ Failed to generate corporate profile")
+                                st.error("❌ Failed to generate corporate profile.")
                     elif st.session_state.action == "Analyze Presentation":
                         if uploaded_file.type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
                             with st.spinner("🔍 Analyzing presentation..."):
                                 analysis = st.session_state.doc_generator.analyze_existing_presentation(
-                                    content = st.session_state.file_content,
-                                    document_type = "Presentation"
-                                    )
+                                    content=st.session_state.file_content,
+                                    document_type="Presentation"
+                                )
                                 if analysis:
                                     st.success("✅ **Presentation analysis complete!**")
                                     st.session_state.analysis_result = analysis
-                                    st.session_state.chat_history = []
                                 else:
                                     st.error("❌ Failed to analyze the presentation.")
-
                         else:
-                            st.error("❌ Analysis is only supported for PPTX files.")
+                            st.error("❌ Presentation analysis is only supported for PPTX files.")
+
                     else:
                          st.error("❌ Please select an action.")
+
         else:
             st.info("📄 Upload a document to begin.")
 
@@ -734,27 +797,29 @@ def main():
                         slide_title = section_data.get('slide_title', 'No Title')
                         slide_body = section_data.get('content', '')
                         slide_visual = section_data.get('suggested_visual', '')
-
+                        
                         st.subheader(slide_title)
+
+                        st.markdown("**Content:**")
                         if slide_body:
                             st.markdown(slide_body, unsafe_allow_html=True)
                         else:
                             st.markdown("_No content provided._")
+                        
+                        st.markdown("**Suggested Visual Idea:**")
                         if slide_visual:
                             if re.match(r'^https?://', slide_visual):
                                 st.image(slide_visual)
                             else:
                                 # If the visual is not a URL, display as placeholder
-                                st.markdown(f'<div class="tooltip"><img src="https://via.placeholder.com/800x600?text={slide_visual.replace(" ", "+")}" alt="Placeholder Visual" style="max-width:100%;" /><span class="tooltiptext">Placeholder: {slide_visual}</span></div>', unsafe_allow_html=True)
+                                st.markdown(f"{slide_visual}")
                         else:
                             st.markdown("_No visual provided._")
-
-                        with st.expander("✏️ Edit This Slide"):
+                        
+                        with st.expander(f"✏️ Edit Slide {i+1}"):
                             
-                            user_input = st.text_input(f"Edit Slide {i + 1} Content:",key=f"slide_edit_{i}", placeholder="Enter your instructions for this slide...")
-
-                            if st.button(f"Submit Edit Slide {i+1}",key=f"submit_edit_{i}"):
-
+                            user_input = st.text_input(f"Edit Slide {i + 1} Content:", key=f"slide_edit_{i}", placeholder="Enter your instructions for this slide...")
+                            if st.button(f"Submit Edit Slide {i+1}", key=f"submit_edit_{i}"):
                                 if user_input:
                                     st.session_state.chat_history.append({
                                         'type': 'user',
@@ -778,6 +843,43 @@ def main():
                                             st.rerun()
                                         else:
                                             st.error("❌ Failed to update the slide.")
+                                else:
+                                    st.warning("⚠️ Please provide edit instructions.")
+
+                # Add the option to edit all slides at once
+                st.markdown("---")
+                st.header("📝 Apply Global Edit to All Slides")
+
+                with st.expander("✏️ Global Edit"):
+                    global_edit_instruction = st.text_input(
+                        "Enter your global edit instruction:",
+                        placeholder="e.g., 'Add more details to all slides', 'Make the tone more formal'"
+                    )
+                    if st.button("Apply Global Edit"):
+                        if global_edit_instruction.strip():
+                            st.session_state.chat_history.append({
+                                'type': 'user',
+                                'message': f"✍️ Global Edit: {global_edit_instruction.strip()}"
+                            })
+                            with st.spinner("🔧 Applying global edit to all slides..."):
+                                updated_slides = st.session_state.doc_generator.apply_global_edit(
+                                    instruction=global_edit_instruction.strip(),
+                                    slides=st.session_state.generated_document_sections,
+                                    document_type=st.session_state.document_type
+                                )
+                                if updated_slides:
+                                    st.session_state.generated_document_sections = updated_slides
+                                    st.session_state.chat_history.append({
+                                        'type': 'assistant',
+                                        'message': "✅ Global edit applied successfully to all slides!"
+                                    })
+                                    st.success("✅ Global edit applied successfully to all slides!")
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Failed to apply global edit to all slides.")
+                        else:
+                            st.warning("⚠️ Please enter a valid edit instruction.")
+
             else:
                  st.header("📄 Full Document View")
                 
@@ -790,7 +892,7 @@ def main():
             col2_1, col2_2 = st.columns(2)
             with col2_1:
                 if st.session_state.view_mode == "Slide View":
-                   # Download slides as text
+                   # Download slides as JSON
                     slide_texts = [json.dumps(slide) for slide in st.session_state.generated_document_sections]
                     st.download_button(
                         label="💾 Download Slides as JSON",
@@ -824,7 +926,6 @@ def main():
         if st.session_state.analysis_result:
             st.header("🔍 Presentation Analysis")
             st.markdown(st.session_state.analysis_result, unsafe_allow_html=True)
-
 
     st.markdown("---")
     st.subheader("📜 Session History")
